@@ -74,8 +74,8 @@ const GRAB_SMOOTHING = 0.7;     // position lerp factor
 // SCENE SETUP
 // ============================================================
 const scene = new THREE.Scene();
-// AR: transparent background for passthrough, VR: dark background
-scene.background = null;
+// Background: dark for desktop, null (transparent) for AR passthrough
+scene.background = new THREE.Color(0x1a1a2e);
 
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
 camera.position.set(0, 1.5, 0.5);
@@ -1068,6 +1068,7 @@ async function enterVR() {
     renderer.xr.setSession(session);
     startBtn.style.display = 'none';
     infoEl.textContent = 'Hand tracking active - Place panels on frame';
+    if (mode === 'immersive-ar') scene.background = null; // transparent for passthrough
     window.__xrError = null;
 
     session.addEventListener('end', () => {
@@ -1083,11 +1084,17 @@ async function enterVR() {
 }
 
 // Button click
-document.getElementById('startBtn').addEventListener('click', enterVR);
-// Also allow tapping anywhere on the page to enter VR
-document.body.addEventListener('click', (e) => {
-  if (e.target.id !== 'startBtn' && !renderer.xr.isPresenting) enterVR();
+document.getElementById('startBtn').addEventListener('click', async () => {
+  if (navigator.xr) {
+    await enterVR();
+  } else {
+    // No WebXR: desktop mode, hide button
+    document.getElementById('startBtn').style.display = 'none';
+    document.getElementById('info').textContent = 'Desktop Mode — Drag panels, click wrench, drag to turn screws (right-click to unlock)';
+  }
 });
+// Prevent context menu for right-click unlock
+renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
 
 renderer.setAnimationLoop(animate);
 
@@ -1099,14 +1106,40 @@ window.addEventListener('resize', () => {
 });
 
 // ============================================================
-// DESKTOP PREVIEW: Mouse controls for testing without XR
+// DESKTOP PREVIEW: Full mouse simulation (panels + wrench + screws)
 // ============================================================
 let mouseDown = false;
-let selectedPanel = null;
+let selectedObj = null;
+let desktopWrenchLocked = false;
+let desktopLockedScrew = null;
+let desktopLastY = null;
 const raycaster = new THREE.Raycaster();
 const mouse = new THREE.Vector2();
 
+function getMouseWorldPos(e) {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0.3);
+  const point = new THREE.Vector3();
+  raycaster.ray.intersectPlane(plane, point);
+  return point;
+}
+
 renderer.domElement.addEventListener('mousedown', (e) => {
+  if (e.button === 2) {
+    // Right click: unlock wrench
+    if (desktopWrenchLocked) {
+      desktopWrenchLocked = false;
+      desktopLockedScrew = null;
+      wrenchState.locked = false;
+      wrenchState.lockedScrew = null;
+      activeScrew = null;
+      currentTorque = 0;
+      desktopLastY = null;
+    }
+    return;
+  }
   mouseDown = true;
   mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
   mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
@@ -1116,27 +1149,87 @@ renderer.domElement.addEventListener('mousedown', (e) => {
     for (const panel of panels) {
       if (panel.userData.snapped) continue;
       const intersects = raycaster.intersectObjects(panel.children, true);
-      if (intersects.length > 0) { selectedPanel = panel; break; }
+      if (intersects.length > 0) { selectedObj = panel; break; }
+    }
+  } else if (phase === 'SCREW_PHASE') {
+    if (desktopWrenchLocked) {
+      // Already locked: start Y-tracking
+      desktopLastY = e.clientY;
+    } else {
+      // Try grab wrench
+      const intersects = raycaster.intersectObjects(toolGroup.children, true);
+      if (intersects.length > 0) {
+        selectedObj = toolGroup;
+        toolGroup.userData.grabbed = true;
+      }
     }
   }
 });
 
 renderer.domElement.addEventListener('mousemove', (e) => {
-  if (!mouseDown || !selectedPanel) return;
-  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
-  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
-  raycaster.setFromCamera(mouse, camera);
-  const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0.3);
-  const point = new THREE.Vector3();
-  raycaster.ray.intersectPlane(plane, point);
-  if (point) selectedPanel.position.copy(point);
+  if (!mouseDown) return;
+  const worldPos = getMouseWorldPos(e);
+
+  if (phase === 'PANEL_PLACEMENT' && selectedObj && selectedObj.userData.type === 'panel') {
+    if (worldPos) selectedObj.position.copy(worldPos);
+  } else if (phase === 'SCREW_PHASE') {
+    if (desktopWrenchLocked && desktopLockedScrew) {
+      // Y movement = turn screw
+      const deltaY = (desktopLastY - e.clientY) * 0.002;
+      const sd = desktopLockedScrew.userData;
+      sd.turns += deltaY;
+      sd.turns = Math.max(0, Math.min(sd.maxTurns, sd.turns));
+      const progress = sd.turns / sd.maxTurns;
+      currentTorque = progress * progress * MAX_TORQUE;
+      desktopLockedScrew.position.z = sd.startZ - sd.turns * SCREW_PITCH;
+      desktopLockedScrew.rotation.z += deltaY * Math.PI * 2;
+      updateTorqueDisplay(currentTorque, sd.turns, sd.maxTurns);
+      // Check completion
+      if (sd.turns >= sd.maxTurns && !sd.inserted) {
+        sd.inserted = true;
+        sd.turns = sd.maxTurns;
+        desktopLockedScrew.children[0].material = desktopLockedScrew.children[0].material.clone();
+        desktopLockedScrew.children[0].material.color.set(0x44ff44);
+        desktopWrenchLocked = false;
+        desktopLockedScrew = null;
+        wrenchState.locked = false;
+        wrenchState.lockedScrew = null;
+        activeScrew = null;
+        currentTorque = 0;
+        checkAllScrews();
+      }
+      desktopLastY = e.clientY;
+    } else if (selectedObj === toolGroup && worldPos) {
+      // Move wrench freely
+      toolGroup.position.copy(worldPos);
+      // Check lock to screw
+      const tipWorld = new THREE.Vector3(0, -0.035, 0);
+      toolGroup.localToWorld(tipWorld);
+      for (const screw of screws) {
+        if (screw.userData.inserted) continue;
+        if (tipWorld.distanceTo(screw.position) < 0.04) {
+          desktopWrenchLocked = true;
+          desktopLockedScrew = screw;
+          wrenchState.locked = true;
+          wrenchState.lockedScrew = screw;
+          activeScrew = screw;
+          toolGroup.position.set(screw.position.x, screw.position.y + 0.035, screw.position.z);
+          break;
+        }
+      }
+    }
+  }
 });
 
 renderer.domElement.addEventListener('mouseup', () => {
-  if (selectedPanel) {
-    trySnap(selectedPanel);
-    selectedPanel = null;
+  if (selectedObj && selectedObj.userData?.type === 'panel' && !selectedObj.userData.snapped) {
+    trySnap(selectedObj);
   }
+  if (selectedObj === toolGroup && !desktopWrenchLocked) {
+    toolGroup.userData.grabbed = false;
+  }
+  selectedObj = null;
+  desktopLastY = null;
   mouseDown = false;
 });
 
