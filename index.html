@@ -62,7 +62,7 @@ import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 // CONFIG
 // ============================================================
 const REQUIRED_TURNS = 4.0;
-const SCREW_PITCH = 0.002;       // meters per turn (2mm pitch)
+const SCREW_PITCH = 0.005;       // meters per turn (5mm pitch, visible)
 const MAX_TORQUE = 8.5;          // N·m (aviation spec)
 const SNAP_DISTANCE = 0.08;     // 8cm snap threshold (forgiving)
 const GRAB_DISTANCE = 0.05;     // 5cm grab threshold (wider)
@@ -185,34 +185,37 @@ const screws = [];
 
 function createScrew(pos) {
   const group = new THREE.Group();
-  // Screw head
-  const headMat = new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 0.9, roughness: 0.2 });
-  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.004, 6), headMat);
+  const totalLen = SCREW_PITCH * REQUIRED_TURNS; // total screw travel
+
+  // Hex head (6-sided bolt head, visible)
+  const headMat = new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 0.9, roughness: 0.15 });
+  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.008, 6), headMat);
   head.rotation.x = Math.PI / 2;
+  head.position.z = 0.004;
   group.add(head);
-  // Cross slot on head
-  const slotMat = new THREE.MeshStandardMaterial({ color: 0x333333 });
-  const slot1 = new THREE.Mesh(new THREE.BoxGeometry(0.008, 0.001, 0.002), slotMat);
-  slot1.position.z = 0.003;
-  group.add(slot1);
-  const slot2 = new THREE.Mesh(new THREE.BoxGeometry(0.001, 0.008, 0.002), slotMat);
-  slot2.position.z = 0.003;
-  group.add(slot2);
-  // Screw shaft
-  const shaftMat = new THREE.MeshStandardMaterial({ color: 0x999999, metalness: 0.8, roughness: 0.3 });
-  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.003, 0.003, SCREW_PITCH * REQUIRED_TURNS, 16), shaftMat);
+
+  // Washer
+  const washerMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, metalness: 0.8 });
+  const washer = new THREE.Mesh(new THREE.CylinderGeometry(0.015, 0.015, 0.002, 16), washerMat);
+  washer.rotation.x = Math.PI / 2;
+  washer.position.z = -0.001;
+  group.add(washer);
+
+  // Shaft (threaded rod - longer, visible)
+  const shaftMat = new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.8, roughness: 0.3 });
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.005, 0.005, totalLen + 0.01, 16), shaftMat);
   shaft.rotation.x = Math.PI / 2;
-  shaft.position.z = -(SCREW_PITCH * REQUIRED_TURNS) / 2;
-  shaft.visible = true;
+  shaft.position.z = -(totalLen + 0.01) / 2;
   group.add(shaft);
-  // Thread helix visual
-  const threadMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, metalness: 0.7 });
-  for (let i = 0; i < REQUIRED_TURNS * 8; i++) {
-    const angle = (i / 8) * Math.PI * 2;
-    const z = -(i / (REQUIRED_TURNS * 8)) * (SCREW_PITCH * REQUIRED_TURNS);
-    const threadBit = new THREE.Mesh(new THREE.SphereGeometry(0.0005, 4, 4), threadMat);
-    threadBit.position.set(Math.cos(angle) * 0.0035, Math.sin(angle) * 0.0035, z);
-    group.add(threadBit);
+
+  // Thread rings (visible spiral grooves)
+  const threadMat = new THREE.MeshStandardMaterial({ color: 0x666666, metalness: 0.6 });
+  const threadCount = REQUIRED_TURNS * 4;
+  for (let i = 0; i < threadCount; i++) {
+    const z = -(i / threadCount) * totalLen - 0.005;
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.006, 0.001, 4, 16), threadMat);
+    ring.position.z = z;
+    group.add(ring);
   }
 
   group.position.copy(pos);
@@ -258,15 +261,25 @@ function createTool() {
   scaleWindow.position.y = 0.15;
   toolGroup.add(scaleWindow);
 
-  // Head (socket end - wider)
-  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.025, 6), darkMetal);
-  head.position.y = -0.012;
-  toolGroup.add(head);
+  // 90-degree bend joint
+  const joint = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.018, 0.018), darkMetal);
+  joint.position.y = -0.005;
+  toolGroup.add(joint);
 
-  // Socket opening (where it attaches to bolt/screw)
-  const socket = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.015, 6), darkMetal);
-  socket.position.y = -0.03;
-  toolGroup.add(socket);
+  // Horizontal arm (goes forward toward screw)
+  const arm = new THREE.Mesh(new THREE.BoxGeometry(0.014, 0.014, 0.04), chrome);
+  arm.position.set(0, -0.005, -0.03);
+  toolGroup.add(arm);
+
+  // Socket head (at end of arm, points down into screw)
+  const socketHead = new THREE.Mesh(new THREE.CylinderGeometry(0.013, 0.013, 0.02, 6), darkMetal);
+  socketHead.position.set(0, -0.005, -0.055);
+  toolGroup.add(socketHead);
+
+  // Socket opening (hex hole)
+  const socketHole = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.01, 6), new THREE.MeshStandardMaterial({ color: 0x111111 }));
+  socketHole.position.set(0, -0.005, -0.065);
+  toolGroup.add(socketHole);
 
   // Torque value canvas (attached above wrench)
   const tCanvas = document.createElement('canvas');
@@ -923,7 +936,7 @@ function animate() {
         toolGroup.position.lerp(pinchPoint, GRAB_SMOOTHING);
 
         // Check if socket end is near a screw → auto-lock
-        const tipWorld = new THREE.Vector3(0, -0.035, 0);
+        const tipWorld = new THREE.Vector3(0, -0.005, -0.065);
         toolGroup.localToWorld(tipWorld);
         for (const screw of screws) {
           if (screw.userData.inserted) continue;
@@ -934,7 +947,7 @@ function animate() {
             activeScrew = screw;
             wrenchState.lastY = pinchPoint.y;
             // Position wrench above screw
-            toolGroup.position.set(screw.position.x, screw.position.y + 0.035, screw.position.z);
+            toolGroup.position.set(screw.position.x, screw.position.y, screw.position.z + 0.065);
             toolGroup.rotation.set(0, 0, 0);
             break;
           }
@@ -944,10 +957,10 @@ function animate() {
         const screw = wrenchState.lockedScrew;
         const sd = screw.userData;
 
-        // Wrench stays above screw, handle follows hand X/Z
+        // Wrench socket stays on screw (90-degree head extends forward in Z)
         toolGroup.position.x = screw.position.x;
-        toolGroup.position.z = screw.position.z;
-        toolGroup.position.y = screw.position.y + 0.035;
+        toolGroup.position.z = screw.position.z + 0.065;
+        toolGroup.position.y = screw.position.y;
 
         // Tilt handle toward hand position for visual feedback
         const dx = pinchPoint.x - screw.position.x;
@@ -1172,7 +1185,7 @@ renderer.domElement.addEventListener('mousedown', (e) => {
     }
   } else if (phase === 'SCREW_PHASE') {
     if (desktopWrenchLocked) {
-      desktopLastY = e.clientY;
+      desktopLastY = e.clientX;
     } else {
       // Try grab wrench - raycast all wrench meshes
       const wrenchMeshes = [];
@@ -1194,15 +1207,19 @@ renderer.domElement.addEventListener('mousemove', (e) => {
     if (worldPos) selectedObj.position.copy(worldPos);
   } else if (phase === 'SCREW_PHASE') {
     if (desktopWrenchLocked && desktopLockedScrew) {
-      // Y movement = turn screw
-      const deltaY = (desktopLastY - e.clientY) * 0.002;
+      // LEFT/RIGHT mouse = rotate screw (clockwise=tighten, counter=loosen)
+      const deltaX = (e.clientX - desktopLastY) * 0.003; // positive = right = tighten
       const sd = desktopLockedScrew.userData;
-      sd.turns += deltaY;
+      sd.turns += deltaX;
       sd.turns = Math.max(0, Math.min(sd.maxTurns, sd.turns));
       const progress = sd.turns / sd.maxTurns;
       currentTorque = progress * progress * MAX_TORQUE;
+      // Screw moves INTO surface (Z axis)
       desktopLockedScrew.position.z = sd.startZ - sd.turns * SCREW_PITCH;
-      desktopLockedScrew.rotation.z += deltaY * Math.PI * 2;
+      // Screw rotates visually
+      desktopLockedScrew.rotation.z += deltaX * Math.PI * 2;
+      // Wrench rotates around screw
+      toolGroup.rotation.y = Math.sin(performance.now() * 0.01) * 0.05; // subtle wobble
       updateTorqueDisplay(currentTorque, sd.turns, sd.maxTurns);
       // Check completion
       if (sd.turns >= sd.maxTurns && !sd.inserted) {
@@ -1218,12 +1235,12 @@ renderer.domElement.addEventListener('mousemove', (e) => {
         currentTorque = 0;
         checkAllScrews();
       }
-      desktopLastY = e.clientY;
+      desktopLastY = e.clientX; // track X now, not Y
     } else if (selectedObj === toolGroup && worldPos) {
       // Move wrench freely
       toolGroup.position.copy(worldPos);
       // Check lock to screw
-      const tipWorld = new THREE.Vector3(0, -0.035, 0);
+      const tipWorld = new THREE.Vector3(0, -0.005, -0.065);
       toolGroup.localToWorld(tipWorld);
       for (const screw of screws) {
         if (screw.userData.inserted) continue;
@@ -1233,7 +1250,7 @@ renderer.domElement.addEventListener('mousemove', (e) => {
           wrenchState.locked = true;
           wrenchState.lockedScrew = screw;
           activeScrew = screw;
-          toolGroup.position.set(screw.position.x, screw.position.y + 0.035, screw.position.z);
+          toolGroup.position.set(screw.position.x, screw.position.y, screw.position.z + 0.065);
           break;
         }
       }
