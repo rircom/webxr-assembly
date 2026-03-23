@@ -290,7 +290,7 @@ function createTool() {
 }
 createTool();
 
-function updateTorqueDisplay(torqueVal, turns, maxTurns) {
+function updateTorqueDisplay(torqueVal, turns, maxTurns, clicked = false) {
   if (!torqueDisplay) return;
   const canvas = torqueDisplay.userData.canvas;
   const ctx = canvas.getContext('2d');
@@ -313,6 +313,12 @@ function updateTorqueDisplay(torqueVal, turns, maxTurns) {
   ctx.fillRect(170, 8, 80, 48);
   ctx.fillStyle = color;
   ctx.fillRect(170, 8 + 48 * (1 - turns / maxTurns), 80, 48 * (turns / maxTurns));
+  // Click indicator
+  if (clicked) {
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText('CLICK!', 85, 54);
+  }
   torqueDisplay.userData.texture.needsUpdate = true;
 }
 
@@ -331,9 +337,10 @@ const handStates = {
 
 // Wrench lock state
 const wrenchState = {
-  locked: false,       // is wrench locked to a screw?
-  lockedScrew: null,   // which screw
-  heldBy: null         // 'left' or 'right'
+  locked: false,
+  lockedScrew: null,
+  heldBy: null,
+  lastY: null          // previous Y position for push/pull detection
 };
 
 // ============================================================
@@ -450,24 +457,7 @@ function trySnap(panel) {
 }
 
 function flashEffect(pos) {
-  const flashMat = new THREE.MeshBasicMaterial({ color: 0x00ff88, transparent: true, opacity: 0.8 });
-  const flash = new THREE.Mesh(new THREE.SphereGeometry(0.05, 16, 16), flashMat);
-  flash.position.copy(pos);
-  scene.add(flash);
-  const startTime = performance.now();
-  function animFlash() {
-    const elapsed = (performance.now() - startTime) / 1000;
-    flash.scale.setScalar(1 + elapsed * 3);
-    flash.material.opacity = 0.8 - elapsed * 2;
-    if (flash.material.opacity > 0) {
-      requestAnimationFrame(animFlash);
-    } else {
-      scene.remove(flash);
-      flash.geometry.dispose();
-      flash.material.dispose();
-    }
-  }
-  animFlash();
+  // removed — no green spheres
 }
 
 // ============================================================
@@ -840,195 +830,191 @@ function animate() {
     { xrHand: hand2, key: 'right' }
   ];
 
+  // Helper: grab/move panel for either hand
+  function handlePanelGrab(xrHand, key, state) {
+    const pp = getPinchPoint(xrHand);
+    if (!state.grabbed) {
+      if (isPinchGrab(xrHand, key) && pp) {
+        for (const panel of panels) {
+          if (panel.userData.snapped) continue;
+          if (pp.distanceTo(panel.position) < GRAB_DISTANCE) {
+            state.grabbed = panel;
+            state.grabOffset = new THREE.Vector3().subVectors(panel.position, pp);
+            break;
+          }
+        }
+      }
+    } else {
+      if (!isPinchHeld(xrHand, key)) {
+        if (!state.grabbed.userData.snapped) trySnap(state.grabbed);
+        state.grabbed = null;
+      } else if (pp) {
+        const tp = pp.clone().add(state.grabOffset || new THREE.Vector3());
+        state.grabbed.position.lerp(tp, GRAB_SMOOTHING);
+      }
+    }
+  }
+
   for (const { xrHand, key } of xrHands) {
     if (!xrHand || !xrHand.joints || Object.keys(xrHand.joints).length === 0) continue;
     const state = handStates[key];
     const pinchPoint = getPinchPoint(xrHand);
 
-    // === LEFT HAND: Release wrench from screw ===
+    // Panel placement: both hands can grab
+    if (phase === 'PANEL_PLACEMENT') {
+      handlePanelGrab(xrHand, key, state);
+      continue;
+    }
+
+    if (phase !== 'SCREW_PHASE') continue;
+
+    // === LEFT HAND: unlock wrench from screw ===
     if (key === 'left') {
       if (wrenchState.locked && isPinchGrab(xrHand, key) && pinchPoint) {
-        const d = pinchPoint.distanceTo(toolGroup.position);
-        if (d < 0.08) {
-          // Left hand grabs near wrench → unlock from screw
+        if (pinchPoint.distanceTo(toolGroup.position) < 0.10) {
           wrenchState.locked = false;
           wrenchState.lockedScrew = null;
           activeScrew = null;
           currentTorque = 0;
-          handStates.right.prevWristAngle = null;
-          updateTorqueDisplay(0, 0, REQUIRED_TURNS);
-        }
-      }
-      // Left hand also handles panels during placement phase
-      if (phase === 'PANEL_PLACEMENT') {
-        if (!state.grabbed) {
-          if (isPinchGrab(xrHand, key) && pinchPoint) {
-            for (const panel of panels) {
-              if (panel.userData.snapped) continue;
-              if (pinchPoint.distanceTo(panel.position) < GRAB_DISTANCE) {
-                state.grabbed = panel;
-                state.grabOffset = new THREE.Vector3().subVectors(panel.position, pinchPoint);
-                break;
-              }
-            }
-          }
-        } else {
-          if (!isPinchHeld(xrHand, key)) {
-            if (!state.grabbed.userData.snapped) trySnap(state.grabbed);
-            state.grabbed = null;
-          } else if (pinchPoint) {
-            const tp = pinchPoint.clone().add(state.grabOffset || new THREE.Vector3());
-            state.grabbed.position.lerp(tp, GRAB_SMOOTHING);
-          }
+          wrenchState.lastY = null;
+          toolGroup.userData.grabbed = false;
+          handStates.right.grabbed = null;
         }
       }
       continue;
     }
 
-    // === RIGHT HAND: Grab tool, grab panels, turn screws ===
-
-    // Panel grab (placement phase)
-    if (phase === 'PANEL_PLACEMENT') {
-      if (!state.grabbed) {
-        if (isPinchGrab(xrHand, key) && pinchPoint) {
-          for (const panel of panels) {
-            if (panel.userData.snapped) continue;
-            if (pinchPoint.distanceTo(panel.position) < GRAB_DISTANCE) {
-              state.grabbed = panel;
-              state.grabOffset = new THREE.Vector3().subVectors(panel.position, pinchPoint);
-              break;
-            }
-          }
-        }
-      } else {
-        if (!isPinchHeld(xrHand, key)) {
-          if (!state.grabbed.userData.snapped) trySnap(state.grabbed);
-          state.grabbed = null;
-        } else if (pinchPoint) {
-          const tp = pinchPoint.clone().add(state.grabOffset || new THREE.Vector3());
-          state.grabbed.position.lerp(tp, GRAB_SMOOTHING);
-        }
-      }
-      continue;
-    }
-
-    // Screw phase: wrench handling
-    if (phase !== 'SCREW_PHASE') continue;
-
+    // === RIGHT HAND: grab wrench, lock to screw, push/pull ===
     if (!toolGroup.userData.grabbed) {
-      // Try to grab wrench with right hand
+      // Grab wrench
       if (isPinchGrab(xrHand, key) && pinchPoint) {
         if (pinchPoint.distanceTo(toolGroup.position) < GRAB_DISTANCE) {
           toolGroup.userData.grabbed = true;
-          wrenchState.heldBy = 'right';
           state.grabbed = toolGroup;
+          wrenchState.lastY = null;
         }
       }
     } else {
-      // Already holding wrench
-      if (!isPinchHeld(xrHand, key)) {
-        // Release wrench (but don't unlock from screw)
-        if (!wrenchState.locked) {
+      // Holding wrench
+      const holding = isPinchHeld(xrHand, key);
+
+      if (!holding) {
+        // Released hand
+        if (wrenchState.locked) {
+          // Locked to screw: value FREEZES, wrench stays, hand released
           toolGroup.userData.grabbed = false;
-          wrenchState.heldBy = null;
           state.grabbed = null;
-          state.prevWristAngle = null;
+          wrenchState.lastY = null;
+          // wrench stays locked, torque stays frozen
+        } else {
+          // Free wrench: drop it
+          toolGroup.userData.grabbed = false;
+          state.grabbed = null;
+          wrenchState.lastY = null;
         }
-        // If locked to screw, keep holding
+        continue;
       }
 
-      // Move wrench with right hand
-      if (pinchPoint && toolGroup.userData.grabbed) {
-        const wrist = getJointPosition(xrHand, 'wrist');
-        const middleTip = getJointPosition(xrHand, 'middle-finger-tip');
+      if (!pinchPoint) continue;
 
-        if (!wrenchState.locked) {
-          // Free movement: follow hand
-          if (wrist && middleTip) {
-            const palmCenter = new THREE.Vector3().addVectors(wrist, pinchPoint).multiplyScalar(0.5);
-            toolGroup.position.lerp(palmCenter, GRAB_SMOOTHING);
-            const dir = new THREE.Vector3().subVectors(middleTip, wrist).normalize();
-            const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, -1, 0), dir);
-            toolGroup.quaternion.slerp(q, 0.4);
-          }
+      if (!wrenchState.locked) {
+        // FREE MODE: wrench follows pinch point directly
+        toolGroup.position.lerp(pinchPoint, GRAB_SMOOTHING);
 
-          // Check if wrench tip is near a screw → auto-lock
-          const tipPos = new THREE.Vector3(0, -0.035, 0);
-          toolGroup.localToWorld(tipPos);
-          for (const screw of screws) {
-            if (screw.userData.inserted) continue;
-            if (tipPos.distanceTo(screw.position) < 0.03) {
-              // LOCK onto screw!
-              wrenchState.locked = true;
-              wrenchState.lockedScrew = screw;
-              activeScrew = screw;
-              state.prevWristAngle = null;
-              flashEffect(screw.position);
-              break;
-            }
-          }
-        } else {
-          // LOCKED to screw: wrench pivots around screw
-          const screw = wrenchState.lockedScrew;
-          // Keep socket end at screw position
-          const screwPos = screw.position.clone();
-          const socketOffset = new THREE.Vector3(0, -0.035, 0);
-          toolGroup.localToWorld(socketOffset);
-          const correction = new THREE.Vector3().subVectors(screwPos, socketOffset);
-          toolGroup.position.add(correction.multiplyScalar(0.5));
-
-          // Rotation: track hand rotation for torque
-          const indexTip = getJointPosition(xrHand, 'index-finger-tip');
-          const thumbTip = getJointPosition(xrHand, 'thumb-tip');
-          if (indexTip && thumbTip) {
-            const screwAxis = new THREE.Vector3(0, 0, -1);
-            const handVec = new THREE.Vector3().subVectors(indexTip, thumbTip);
-            const projected = handVec.clone().projectOnPlane(screwAxis);
-            const currentAngle = Math.atan2(projected.y, projected.x);
-
-            if (state.prevWristAngle !== null) {
-              let deltaAngle = currentAngle - state.prevWristAngle;
-              while (deltaAngle > Math.PI) deltaAngle -= Math.PI * 2;
-              while (deltaAngle < -Math.PI) deltaAngle += Math.PI * 2;
-              if (Math.abs(deltaAngle) < 0.008) { state.prevWristAngle = currentAngle; continue; }
-              deltaAngle = Math.max(-0.25, Math.min(0.25, deltaAngle));
-
-              const sd = screw.userData;
-              sd.turns += deltaAngle / (Math.PI * 2);
-              sd.turns = Math.max(0, Math.min(sd.maxTurns, sd.turns));
-
-              // Torque (exponential curve)
-              const progress = sd.turns / sd.maxTurns;
-              currentTorque = progress * progress * MAX_TORQUE;
-
-              // Visual: screw moves in
-              screw.position.z = sd.startZ - sd.turns * SCREW_PITCH;
-              screw.rotation.z += deltaAngle;
-
-              // Rotate wrench visually around screw axis
-              toolGroup.rotateOnWorldAxis(new THREE.Vector3(0, 0, 1), deltaAngle * 0.3);
-
-              // Check completion
-              if (sd.turns >= sd.maxTurns && !sd.inserted) {
-                sd.inserted = true;
-                sd.turns = sd.maxTurns;
-                screw.children[0].material = screw.children[0].material.clone();
-                screw.children[0].material.color.set(0x00ff00);
-                screw.children[0].material.emissive = new THREE.Color(0x00ff00);
-                screw.children[0].material.emissiveIntensity = 0.5;
-                flashEffect(screw.position);
-                // Auto-unlock after insertion
-                wrenchState.locked = false;
-                wrenchState.lockedScrew = null;
-                activeScrew = null;
-                currentTorque = 0;
-                state.prevWristAngle = null;
-                checkAllScrews();
-              }
-            }
-            state.prevWristAngle = currentAngle;
+        // Check if socket end is near a screw → auto-lock
+        const tipWorld = new THREE.Vector3(0, -0.035, 0);
+        toolGroup.localToWorld(tipWorld);
+        for (const screw of screws) {
+          if (screw.userData.inserted) continue;
+          if (tipWorld.distanceTo(screw.position) < 0.035) {
+            // LOCK!
+            wrenchState.locked = true;
+            wrenchState.lockedScrew = screw;
+            activeScrew = screw;
+            wrenchState.lastY = pinchPoint.y;
+            // Position wrench above screw
+            toolGroup.position.set(screw.position.x, screw.position.y + 0.035, screw.position.z);
+            toolGroup.rotation.set(0, 0, 0);
+            break;
           }
         }
+      } else {
+        // LOCKED MODE: Y movement = turn screw
+        const screw = wrenchState.lockedScrew;
+        const sd = screw.userData;
+
+        // Wrench stays above screw, handle follows hand X/Z
+        toolGroup.position.x = screw.position.x;
+        toolGroup.position.z = screw.position.z;
+        toolGroup.position.y = screw.position.y + 0.035;
+
+        // Tilt handle toward hand position for visual feedback
+        const dx = pinchPoint.x - screw.position.x;
+        const dz = pinchPoint.z - screw.position.z;
+        toolGroup.rotation.set(0, 0, 0);
+        toolGroup.rotation.z = Math.atan2(dx, 0.1) * 0.3;
+        toolGroup.rotation.x = Math.atan2(dz, 0.1) * 0.3;
+
+        // Track Y movement: down = tighten, up = loosen
+        const currentY = pinchPoint.y;
+        if (wrenchState.lastY !== null) {
+          const deltaY = wrenchState.lastY - currentY; // positive = hand moved DOWN
+          // Dead zone
+          if (Math.abs(deltaY) > 0.001) {
+            // Convert Y movement to turns (5cm movement = 1 full turn)
+            const deltaTurns = deltaY / 0.05;
+            sd.turns += deltaTurns;
+            sd.turns = Math.max(0, Math.min(sd.maxTurns, sd.turns));
+
+            // Torque
+            const progress = sd.turns / sd.maxTurns;
+            currentTorque = progress * progress * MAX_TORQUE;
+
+            // Visual: screw depth
+            screw.position.z = sd.startZ - sd.turns * SCREW_PITCH;
+            screw.rotation.z += deltaTurns * Math.PI * 2;
+
+            // "딸깍" click feedback at each full turn
+            const prevFullTurns = Math.floor((sd.turns - deltaTurns) + 0.001);
+            const currFullTurns = Math.floor(sd.turns + 0.001);
+            if (currFullTurns > prevFullTurns && currFullTurns > 0) {
+              // Haptic vibration (if available)
+              if (renderer.xr.isPresenting) {
+                try {
+                  const session = renderer.xr.getSession();
+                  for (const src of session.inputSources) {
+                    if (src.gamepad && src.gamepad.hapticActuators) {
+                      src.gamepad.hapticActuators[0]?.pulse(0.8, 100);
+                    }
+                  }
+                } catch(e) {}
+              }
+              // Visual click: wrench jolts slightly
+              toolGroup.position.y += 0.005;
+              setTimeout(() => { toolGroup.position.y -= 0.005; }, 80);
+              // Update display with click indicator
+              updateTorqueDisplay(currentTorque, sd.turns, sd.maxTurns, true);
+            }
+
+            // Check completion
+            if (sd.turns >= sd.maxTurns && !sd.inserted) {
+              sd.inserted = true;
+              sd.turns = sd.maxTurns;
+              screw.children[0].material = screw.children[0].material.clone();
+              screw.children[0].material.color.set(0x44ff44);
+              // Auto-unlock
+              wrenchState.locked = false;
+              wrenchState.lockedScrew = null;
+              activeScrew = null;
+              wrenchState.lastY = null;
+              toolGroup.userData.grabbed = false;
+              state.grabbed = null;
+              checkAllScrews();
+              continue;
+            }
+          }
+        }
+        wrenchState.lastY = currentY;
       }
     }
   }
