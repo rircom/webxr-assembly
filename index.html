@@ -64,11 +64,14 @@ import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 const REQUIRED_TURNS = 4.0;
 const SCREW_PITCH = 0.005;       // meters per turn (5mm pitch, visible)
 const MAX_TORQUE = 8.5;          // N·m (aviation spec)
+const TARGET_TORQUE = 8.5;       // dial setting (N·m) — "딸깍" at this value
 const SNAP_DISTANCE = 0.08;     // 8cm snap threshold (forgiving)
-const GRAB_DISTANCE = 0.05;     // 5cm grab threshold (wider)
+const GRAB_DISTANCE = 0.08;     // 8cm grab threshold
 const PINCH_GRAB = 0.03;        // pinch to START grab
 const PINCH_RELEASE = 0.05;     // pinch to RELEASE grab (hysteresis)
 const GRAB_SMOOTHING = 0.7;     // position lerp factor
+const RESISTANCE_START = 0.7;   // resistance starts at 70% progress (뻑뻑해지는 시점)
+const OVERTORQUE_LIMIT = 1.1;   // 110% of target = overtorque warning
 
 // ============================================================
 // SCENE SETUP
@@ -309,29 +312,46 @@ function updateTorqueDisplay(torqueVal, turns, maxTurns, clicked = false) {
   const canvas = torqueDisplay.userData.canvas;
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, 256, 64);
-  // Background
-  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  // Background (flash red on overtorque)
+  ctx.fillStyle = overtorqueWarning ? 'rgba(80,0,0,0.9)' : 'rgba(0,0,0,0.85)';
   ctx.roundRect(0, 0, 256, 64, 6);
   ctx.fill();
   // Torque value
-  const color = torqueVal > MAX_TORQUE * 0.9 ? '#ff3333' : torqueVal > MAX_TORQUE * 0.5 ? '#ffaa00' : '#00ff88';
+  const color = overtorqueWarning ? '#ff0000' : clickTriggered ? '#44ff44' :
+    torqueVal > MAX_TORQUE * 0.9 ? '#ff3333' : torqueVal > MAX_TORQUE * 0.5 ? '#ffaa00' : '#00ff88';
   ctx.fillStyle = color;
   ctx.font = 'bold 28px monospace';
   ctx.fillText(`${torqueVal.toFixed(1)} N·m`, 8, 30);
-  // Turns
-  ctx.fillStyle = '#aaa';
-  ctx.font = '16px monospace';
-  ctx.fillText(`${turns.toFixed(1)}/${maxTurns} turns`, 8, 54);
+  // Target torque indicator
+  ctx.fillStyle = '#666';
+  ctx.font = '11px monospace';
+  ctx.fillText(`target: ${TARGET_TORQUE} N·m`, 8, 54);
   // Progress bar
   ctx.fillStyle = '#333';
   ctx.fillRect(170, 8, 80, 48);
+  const barProgress = Math.min(turns / maxTurns, 1.0);
   ctx.fillStyle = color;
-  ctx.fillRect(170, 8 + 48 * (1 - turns / maxTurns), 80, 48 * (turns / maxTurns));
-  // Click indicator
-  if (clicked) {
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 20px monospace';
-    ctx.fillText('CLICK!', 85, 54);
+  ctx.fillRect(170, 8 + 48 * (1 - barProgress), 80, 48 * barProgress);
+  // Target line
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(170, 8); ctx.lineTo(250, 8);
+  ctx.stroke();
+  // Status indicator
+  if (overtorqueWarning) {
+    ctx.fillStyle = '#ff0000';
+    ctx.font = 'bold 16px monospace';
+    ctx.fillText('OVERTORQUE!', 70, 54);
+  } else if (clickTriggered) {
+    ctx.fillStyle = '#44ff44';
+    ctx.font = 'bold 18px monospace';
+    ctx.fillText('CLICK!', 95, 54);
+  } else {
+    const pct = Math.min((turns/maxTurns) * 100, 100);
+    ctx.fillStyle = '#888';
+    ctx.font = '13px monospace';
+    ctx.fillText(`${turns.toFixed(1)}/${maxTurns} (${pct.toFixed(0)}%)`, 60, 54);
   }
   torqueDisplay.userData.texture.needsUpdate = true;
 }
@@ -507,6 +527,69 @@ function enterScrewPhase() {
 // ============================================================
 // SCREW TURNING LOGIC
 // ============================================================
+
+// Shared torque physics: resistance, click, overtorque
+let clickTriggered = false;  // did "딸깍" happen this grab session?
+let overtorqueWarning = false;
+
+function applyTorquePhysics(screw, rawDelta) {
+  const sd = screw.userData;
+  const progress = sd.turns / sd.maxTurns;
+
+  // Resistance: last 30% turns slower (뻑뻑해지는 느낌)
+  let resistance = 1.0;
+  if (progress > RESISTANCE_START) {
+    resistance = 1.0 - (progress - RESISTANCE_START) / (1.0 - RESISTANCE_START) * 0.7;
+    resistance = Math.max(0.3, resistance);
+  }
+
+  // Apply with resistance
+  const effectiveDelta = rawDelta * resistance;
+  sd.turns += effectiveDelta;
+  sd.turns = Math.max(0, Math.min(sd.maxTurns * OVERTORQUE_LIMIT, sd.turns));
+
+  // Torque calculation
+  const p = Math.min(sd.turns / sd.maxTurns, 1.0);
+  currentTorque = p * p * MAX_TORQUE;
+
+  // Move screw
+  const depth = Math.min(sd.turns, sd.maxTurns) * SCREW_PITCH;
+  screw.position.z = sd.startZ - depth;
+  screw.rotation.z += effectiveDelta * Math.PI * 2;
+
+  // "딸깍" click detection — target torque reached
+  if (sd.turns >= sd.maxTurns && !clickTriggered) {
+    clickTriggered = true;
+    overtorqueWarning = false;
+    // Haptic vibration
+    if (renderer.xr.isPresenting) {
+      try {
+        const session = renderer.xr.getSession();
+        for (const src of session.inputSources) {
+          if (src.gamepad?.hapticActuators?.[0]) {
+            src.gamepad.hapticActuators[0].pulse(1.0, 150);
+          }
+        }
+      } catch(e) {}
+    }
+    // Visual + audio feedback
+    screw.children[0].material = screw.children[0].material.clone();
+    screw.children[0].material.color.set(0x44ff44);
+    sd.inserted = true;
+    sd.turns = sd.maxTurns;
+    checkAllScrews();
+    return 'CLICK'; // signal to caller
+  }
+
+  // Overtorque warning — if they keep going past click
+  if (sd.turns > sd.maxTurns && clickTriggered) {
+    overtorqueWarning = true;
+    return 'OVERTORQUE';
+  }
+
+  return 'OK';
+}
+
 // Bare-hand screw turning: pinch near a screw to turn it
 function updateBareHandScrew(hand, handState, key) {
   if (phase !== 'SCREW_PHASE') return;
@@ -552,23 +635,8 @@ function updateBareHandScrew(hand, handState, key) {
     if (Math.abs(deltaAngle) < 0.01) { handState.prevWristAngle = currentAngle; return; }
     deltaAngle = Math.max(-0.3, Math.min(0.3, deltaAngle));
 
-    const sd = nearestScrew.userData;
-    sd.turns += deltaAngle / (Math.PI * 2);
-    sd.turns = Math.max(0, Math.min(sd.maxTurns, sd.turns));
-    currentTorque = (sd.turns / sd.maxTurns) ** 2 * MAX_TORQUE;
-    nearestScrew.position.z = sd.startZ - sd.turns * SCREW_PITCH;
-    nearestScrew.rotation.z += deltaAngle;
-
-    if (sd.turns >= sd.maxTurns && !sd.inserted) {
-      sd.inserted = true;
-      sd.turns = sd.maxTurns;
-      nearestScrew.children[0].material = nearestScrew.children[0].material.clone();
-      nearestScrew.children[0].material.color.set(0x00ff00);
-      nearestScrew.children[0].material.emissive = new THREE.Color(0x00ff00);
-      nearestScrew.children[0].material.emissiveIntensity = 0.5;
-      flashEffect(nearestScrew.position);
-      checkAllScrews();
-    }
+    const deltaTurns = deltaAngle / (Math.PI * 2);
+    applyTorquePhysics(nearestScrew, deltaTurns);
   }
   handState.prevWristAngle = currentAngle;
 }
@@ -630,33 +698,13 @@ function updateScrewTurning(hand, handState, dt) {
     deltaAngle = Math.max(-0.3, Math.min(0.3, deltaAngle));
 
     const deltaTurns = deltaAngle / (Math.PI * 2);
-    const sd = nearestScrew.userData;
-
-    // Apply rotation (smoothed)
-    sd.turns += deltaTurns;
-    sd.turns = Math.max(0, Math.min(sd.maxTurns, sd.turns));
-
-    // Torque simulation (increases exponentially with depth for realistic feel)
-    const progress = sd.turns / sd.maxTurns;
-    currentTorque = progress * progress * MAX_TORQUE;
-
-    // Move screw along Z axis (into the surface)
-    const depth = sd.turns * SCREW_PITCH;
-    nearestScrew.position.z = sd.startZ - depth;
-
-    // Rotate screw head visually
-    nearestScrew.rotation.z += deltaAngle;
-
-    // Check completion
-    if (sd.turns >= sd.maxTurns && !sd.inserted) {
-      sd.inserted = true;
-      sd.turns = sd.maxTurns;
-      nearestScrew.children[0].material = nearestScrew.children[0].material.clone();
-      nearestScrew.children[0].material.color.set(0x00ff00);
-      nearestScrew.children[0].material.emissive = new THREE.Color(0x00ff00);
-      nearestScrew.children[0].material.emissiveIntensity = 0.5;
-      flashEffect(nearestScrew.position);
-      checkAllScrews();
+    const result = applyTorquePhysics(nearestScrew, deltaTurns);
+    if (result === 'CLICK') {
+      // Auto-unlock after click
+      wrenchState.locked = false;
+      wrenchState.lockedScrew = null;
+      activeScrew = null;
+      handState.prevWristAngle = null;
     }
   }
 
