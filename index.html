@@ -1012,7 +1012,7 @@ function animate() {
         // Socket stays fixed on screw — only Y-axis rotation
         toolGroup.position.set(screw.position.x, screw.position.y, screw.position.z + 0.065);
         // Rotate wrench around screw Y-axis based on accumulated turns
-        toolGroup.rotation.set(sd.turns * Math.PI * 2 * 0.1, 0, 0); // subtle visual rotation
+        toolGroup.rotation.set(0, 0, sd.turns * Math.PI * 2 * 0.1); // subtle visual rotation
 
         // Track Y movement: down = tighten, up = loosen
         const currentY = pinchPoint.y;
@@ -1258,7 +1258,7 @@ renderer.domElement.addEventListener('mousemove', (e) => {
       const sd = desktopLockedScrew.userData;
       // Wrench Y-axis rotation only
       toolGroup.position.set(desktopLockedScrew.position.x, desktopLockedScrew.position.y, desktopLockedScrew.position.z + 0.065);
-      toolGroup.rotation.set(sd.turns * Math.PI * 2 * 0.1, 0, 0);
+      toolGroup.rotation.set(0, 0, sd.turns * Math.PI * 2 * 0.1);
       updateTorqueDisplay(currentTorque, sd.turns, sd.maxTurns);
       if (result === 'CLICK') {
         desktopWrenchLocked = false;
