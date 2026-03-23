@@ -1123,6 +1123,31 @@ async function enterVR() {
 // Prevent context menu for right-click unlock
 renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
 
+// Keyboard shortcuts
+window.addEventListener('keydown', (e) => {
+  if (e.key === 's' || e.key === 'S') {
+    // Skip to screw phase
+    if (phase === 'PANEL_PLACEMENT') {
+      for (const panel of panels) {
+        if (!panel.userData.snapped) {
+          const target = snapTargets.find(t => !t.taken);
+          if (target) {
+            panel.position.copy(target.pos);
+            panel.userData.snapped = true;
+            target.taken = true;
+            panelsSnapped++;
+          }
+        }
+      }
+      if (panelsSnapped >= 2) enterScrewPhase();
+    }
+  }
+  if (e.key === 'r' || e.key === 'R') {
+    // Reset
+    location.reload();
+  }
+});
+
 renderer.setAnimationLoop(animate);
 
 // Resize
@@ -1218,8 +1243,8 @@ renderer.domElement.addEventListener('mousemove', (e) => {
       desktopLockedScrew.position.z = sd.startZ - sd.turns * SCREW_PITCH;
       // Screw rotates visually
       desktopLockedScrew.rotation.z += deltaX * Math.PI * 2;
-      // Wrench rotates around screw
-      toolGroup.rotation.y = Math.sin(performance.now() * 0.01) * 0.05; // subtle wobble
+      // Wrench rotates with screw turning
+      toolGroup.rotation.z += deltaX * Math.PI * 0.5;
       updateTorqueDisplay(currentTorque, sd.turns, sd.maxTurns);
       // Check completion
       if (sd.turns >= sd.maxTurns && !sd.inserted) {
@@ -1238,13 +1263,14 @@ renderer.domElement.addEventListener('mousemove', (e) => {
       desktopLastY = e.clientX; // track X now, not Y
     } else if (selectedObj === toolGroup && worldPos) {
       // Move wrench freely
-      toolGroup.position.copy(worldPos);
-      // Check lock to screw
-      const tipWorld = new THREE.Vector3(0, -0.005, -0.065);
-      toolGroup.localToWorld(tipWorld);
+      toolGroup.position.set(worldPos.x, worldPos.y, worldPos.z);
+      // Check lock to screw (XY distance only, Z doesn't matter on drag plane)
       for (const screw of screws) {
         if (screw.userData.inserted) continue;
-        if (tipWorld.distanceTo(screw.position) < 0.04) {
+        const dx = toolGroup.position.x - screw.position.x;
+        const dy = toolGroup.position.y - screw.position.y;
+        const xyDist = Math.sqrt(dx*dx + dy*dy);
+        if (xyDist < 0.06) {
           desktopWrenchLocked = true;
           desktopLockedScrew = screw;
           wrenchState.locked = true;
