@@ -447,6 +447,72 @@ function enterScrewPhase() {
 // ============================================================
 // SCREW TURNING LOGIC
 // ============================================================
+// Bare-hand screw turning: pinch near a screw to turn it
+function updateBareHandScrew(hand, handState, key) {
+  if (phase !== 'SCREW_PHASE') return;
+  if (handState.grabbed) return; // already holding something
+
+  const pinchPoint = getPinchPoint(hand);
+  if (!pinchPoint) return;
+  if (!isPinchHeld(hand, key)) {
+    handState.prevWristAngle = null;
+    if (activeScrew && !handStates[key === 'left' ? 'right' : 'left'].grabbed) {
+      activeScrew = null;
+      currentTorque = 0;
+    }
+    return;
+  }
+
+  // Find screw near pinch point
+  let nearestScrew = null;
+  let minDist = 0.04;
+  for (const screw of screws) {
+    if (screw.userData.inserted) continue;
+    const d = pinchPoint.distanceTo(screw.position);
+    if (d < minDist) { minDist = d; nearestScrew = screw; }
+  }
+  if (!nearestScrew) return;
+
+  activeScrew = nearestScrew;
+
+  // Rotation from thumb-index vector
+  const indexTip = getJointPosition(hand, 'index-finger-tip');
+  const thumbTip = getJointPosition(hand, 'thumb-tip');
+  if (!indexTip || !thumbTip) return;
+
+  const screwAxis = new THREE.Vector3(0, 0, -1);
+  const handVec = new THREE.Vector3().subVectors(indexTip, thumbTip);
+  const projected = handVec.clone().projectOnPlane(screwAxis);
+  const currentAngle = Math.atan2(projected.y, projected.x);
+
+  if (handState.prevWristAngle !== null) {
+    let deltaAngle = currentAngle - handState.prevWristAngle;
+    while (deltaAngle > Math.PI) deltaAngle -= Math.PI * 2;
+    while (deltaAngle < -Math.PI) deltaAngle += Math.PI * 2;
+    if (Math.abs(deltaAngle) < 0.01) { handState.prevWristAngle = currentAngle; return; }
+    deltaAngle = Math.max(-0.3, Math.min(0.3, deltaAngle));
+
+    const sd = nearestScrew.userData;
+    sd.turns += deltaAngle / (Math.PI * 2);
+    sd.turns = Math.max(0, Math.min(sd.maxTurns, sd.turns));
+    currentTorque = (sd.turns / sd.maxTurns) ** 2 * MAX_TORQUE;
+    nearestScrew.position.z = sd.startZ - sd.turns * SCREW_PITCH;
+    nearestScrew.rotation.z += deltaAngle;
+
+    if (sd.turns >= sd.maxTurns && !sd.inserted) {
+      sd.inserted = true;
+      sd.turns = sd.maxTurns;
+      nearestScrew.children[0].material = nearestScrew.children[0].material.clone();
+      nearestScrew.children[0].material.color.set(0x00ff00);
+      nearestScrew.children[0].material.emissive = new THREE.Color(0x00ff00);
+      nearestScrew.children[0].material.emissiveIntensity = 0.5;
+      flashEffect(nearestScrew.position);
+      checkAllScrews();
+    }
+  }
+  handState.prevWristAngle = currentAngle;
+}
+
 function updateScrewTurning(hand, handState, dt) {
   if (!handState.grabbed || handState.grabbed !== toolGroup) return;
 
@@ -766,6 +832,8 @@ function animate() {
         updateScrewTurning(xrHand, state, dt);
       }
     }
+    // Bare-hand screw turning (no tool needed)
+    updateBareHandScrew(xrHand, state, key);
   }
 
   // Update HUDs
