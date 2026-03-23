@@ -980,42 +980,39 @@ function animate() {
       if (!pinchPoint) continue;
 
       if (!wrenchState.locked) {
-        // FREE MODE: wrench follows pinch point directly
-        toolGroup.position.lerp(pinchPoint, GRAB_SMOOTHING);
+        // FREE MODE: hand grabs at handle (offset so handle center follows hand)
+        const handleTarget = pinchPoint.clone();
+        handleTarget.y -= 0.08; // hand is at handle, tool origin is at joint
+        toolGroup.position.lerp(handleTarget, GRAB_SMOOTHING);
+        toolGroup.rotation.set(0, 0, 0); // keep upright
 
         // Check if socket end is near a screw → auto-lock
         const tipWorld = new THREE.Vector3(0, -0.005, -0.065);
         toolGroup.localToWorld(tipWorld);
         for (const screw of screws) {
           if (screw.userData.inserted) continue;
-          if (tipWorld.distanceTo(screw.position) < 0.035) {
-            // LOCK!
+          if (tipWorld.distanceTo(screw.position) < 0.04) {
             wrenchState.locked = true;
             wrenchState.lockedScrew = screw;
             activeScrew = screw;
             wrenchState.lastY = pinchPoint.y;
-            // Position wrench above screw
+            clickTriggered = false;
+            overtorqueWarning = false;
+            // Socket snaps onto screw
             toolGroup.position.set(screw.position.x, screw.position.y, screw.position.z + 0.065);
             toolGroup.rotation.set(0, 0, 0);
             break;
           }
         }
       } else {
-        // LOCKED MODE: Y movement = turn screw
+        // LOCKED MODE: wrench pivots around screw Y-axis ONLY
         const screw = wrenchState.lockedScrew;
         const sd = screw.userData;
 
-        // Wrench socket stays on screw (90-degree head extends forward in Z)
-        toolGroup.position.x = screw.position.x;
-        toolGroup.position.z = screw.position.z + 0.065;
-        toolGroup.position.y = screw.position.y;
-
-        // Tilt handle toward hand position for visual feedback
-        const dx = pinchPoint.x - screw.position.x;
-        const dz = pinchPoint.z - screw.position.z;
-        toolGroup.rotation.set(0, 0, 0);
-        toolGroup.rotation.z = Math.atan2(dx, 0.1) * 0.3;
-        toolGroup.rotation.x = Math.atan2(dz, 0.1) * 0.3;
+        // Socket stays fixed on screw — only Y-axis rotation
+        toolGroup.position.set(screw.position.x, screw.position.y, screw.position.z + 0.065);
+        // Rotate wrench around screw Y-axis based on accumulated turns
+        toolGroup.rotation.set(0, sd.turns * Math.PI * 2 * 0.1, 0); // subtle visual rotation
 
         // Track Y movement: down = tighten, up = loosen
         const currentY = pinchPoint.y;
@@ -1255,33 +1252,20 @@ renderer.domElement.addEventListener('mousemove', (e) => {
     if (worldPos) selectedObj.position.copy(worldPos);
   } else if (phase === 'SCREW_PHASE') {
     if (desktopWrenchLocked && desktopLockedScrew) {
-      // LEFT/RIGHT mouse = rotate screw (clockwise=tighten, counter=loosen)
-      const deltaX = (e.clientX - desktopLastY) * 0.003; // positive = right = tighten
+      // LEFT/RIGHT mouse = rotate screw
+      const deltaX = (e.clientX - desktopLastY) * 0.003;
+      const result = applyTorquePhysics(desktopLockedScrew, deltaX);
       const sd = desktopLockedScrew.userData;
-      sd.turns += deltaX;
-      sd.turns = Math.max(0, Math.min(sd.maxTurns, sd.turns));
-      const progress = sd.turns / sd.maxTurns;
-      currentTorque = progress * progress * MAX_TORQUE;
-      // Screw moves INTO surface (Z axis)
-      desktopLockedScrew.position.z = sd.startZ - sd.turns * SCREW_PITCH;
-      // Screw rotates visually
-      desktopLockedScrew.rotation.z += deltaX * Math.PI * 2;
-      // Wrench rotates around screw
-      toolGroup.rotation.y = Math.sin(performance.now() * 0.01) * 0.05; // subtle wobble
+      // Wrench Y-axis rotation only
+      toolGroup.position.set(desktopLockedScrew.position.x, desktopLockedScrew.position.y, desktopLockedScrew.position.z + 0.065);
+      toolGroup.rotation.set(0, sd.turns * Math.PI * 2 * 0.1, 0);
       updateTorqueDisplay(currentTorque, sd.turns, sd.maxTurns);
-      // Check completion
-      if (sd.turns >= sd.maxTurns && !sd.inserted) {
-        sd.inserted = true;
-        sd.turns = sd.maxTurns;
-        desktopLockedScrew.children[0].material = desktopLockedScrew.children[0].material.clone();
-        desktopLockedScrew.children[0].material.color.set(0x44ff44);
+      if (result === 'CLICK') {
         desktopWrenchLocked = false;
         desktopLockedScrew = null;
         wrenchState.locked = false;
         wrenchState.lockedScrew = null;
         activeScrew = null;
-        currentTorque = 0;
-        checkAllScrews();
       }
       desktopLastY = e.clientX; // track X now, not Y
     } else if (selectedObj === toolGroup && worldPos) {
