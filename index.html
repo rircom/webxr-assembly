@@ -1,0 +1,901 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aircraft Assembly - WebXR</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; color: #fff; font-family: 'Segoe UI', sans-serif; overflow: hidden; }
+  #info {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.7); padding: 12px 24px; border-radius: 8px;
+    font-size: 14px; z-index: 100; text-align: center;
+  }
+  #startBtn {
+    position: absolute; bottom: 40px; left: 50%; transform: translateX(-50%);
+    padding: 16px 48px; font-size: 20px; background: #0af; color: #000;
+    border: none; border-radius: 12px; cursor: pointer; z-index: 100;
+    font-weight: bold;
+  }
+  #startBtn:hover { background: #0cf; }
+  #hud {
+    position: absolute; top: 60px; right: 20px;
+    background: rgba(0,20,40,0.85); padding: 16px; border-radius: 8px;
+    font-size: 13px; z-index: 100; min-width: 200px; border: 1px solid #0af;
+    display: none;
+  }
+  #hud h3 { color: #0af; margin-bottom: 8px; }
+  #hud .row { display: flex; justify-content: space-between; margin: 4px 0; }
+  #hud .val { color: #0f0; font-weight: bold; }
+  canvas { width: 100%; height: 100%; display: block; }
+</style>
+</head>
+<body>
+
+<div id="info">Aircraft Panel Assembly Trainer - Galaxy XR</div>
+<button id="startBtn">Enter VR</button>
+
+<div id="hud">
+  <h3>TORQUE MONITOR</h3>
+  <div class="row"><span>Phase:</span><span id="hudPhase" class="val">PANEL PLACEMENT</span></div>
+  <div class="row"><span>Screw 1:</span><span id="hudScrew1" class="val">0.00 / 4.00 turns</span></div>
+  <div class="row"><span>Screw 2:</span><span id="hudScrew2" class="val">0.00 / 4.00 turns</span></div>
+  <div class="row"><span>Torque:</span><span id="hudTorque" class="val">0.0 N·m</span></div>
+  <div class="row"><span>Status:</span><span id="hudStatus" class="val">READY</span></div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
+
+// ============================================================
+// CONFIG
+// ============================================================
+const REQUIRED_TURNS = 4.0;
+const SCREW_PITCH = 0.002;       // meters per turn (2mm pitch)
+const MAX_TORQUE = 8.5;          // N·m (aviation spec)
+const SNAP_DISTANCE = 0.05;     // 5cm snap threshold
+const GRAB_DISTANCE = 0.05;     // 5cm grab threshold (wider)
+const PINCH_GRAB = 0.03;        // pinch to START grab
+const PINCH_RELEASE = 0.05;     // pinch to RELEASE grab (hysteresis)
+const GRAB_SMOOTHING = 0.7;     // position lerp factor
+
+// ============================================================
+// SCENE SETUP
+// ============================================================
+const scene = new THREE.Scene();
+// AR: transparent background for passthrough, VR: dark background
+scene.background = null;
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 100);
+camera.position.set(0, 1.5, 0.5);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+// Lighting
+const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(ambient);
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+dirLight.position.set(2, 4, 2);
+dirLight.castShadow = true;
+scene.add(dirLight);
+const pointLight = new THREE.PointLight(0x00aaff, 0.5, 10);
+pointLight.position.set(0, 2, 0);
+scene.add(pointLight);
+
+// ============================================================
+// WORK TABLE
+// ============================================================
+const tableMat = new THREE.MeshStandardMaterial({ color: 0x334455, roughness: 0.8 });
+const table = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.05, 0.8), tableMat);
+table.position.set(0, 0.75, -0.3);
+scene.add(table);
+
+// Aircraft frame (target for panels)
+const frameMat = new THREE.MeshStandardMaterial({ color: 0x556677, metalness: 0.7, roughness: 0.3 });
+const frame = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.3, 0.02), frameMat);
+frame.position.set(0, 0.95, -0.35);
+scene.add(frame);
+
+// Snap target indicators (subtle wireframe outline only)
+function createSnapOutline(pos) {
+  const edges = new THREE.EdgesGeometry(new THREE.BoxGeometry(0.15, 0.11, 0.003));
+  const mat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.25 });
+  const line = new THREE.LineSegments(edges, mat);
+  line.position.copy(pos);
+  scene.add(line);
+  return line;
+}
+
+const snapTarget1 = createSnapOutline(new THREE.Vector3(-0.08, 0.95, -0.335));
+const snapTarget2 = createSnapOutline(new THREE.Vector3(0.08, 0.95, -0.335));
+
+// ============================================================
+// PANELS (2 grabbable objects)
+// ============================================================
+const panelMat1 = new THREE.MeshStandardMaterial({ color: 0xcc8833, metalness: 0.6, roughness: 0.4 });
+const panelMat2 = new THREE.MeshStandardMaterial({ color: 0x8833cc, metalness: 0.6, roughness: 0.4 });
+
+function createPanel(mat, pos) {
+  const group = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.10, 0.008), mat);
+  group.add(body);
+  // Screw holes
+  const holeMat = new THREE.MeshStandardMaterial({ color: 0x222222 });
+  const hole1 = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.004, 0.01, 16), holeMat);
+  hole1.rotation.x = Math.PI / 2;
+  hole1.position.set(-0.04, 0.03, 0);
+  group.add(hole1);
+  const hole2 = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.004, 0.01, 16), holeMat);
+  hole2.rotation.x = Math.PI / 2;
+  hole2.position.set(0.04, -0.03, 0);
+  group.add(hole2);
+  group.position.copy(pos);
+  group.userData = { grabbable: true, snapped: false, snapTarget: null, type: 'panel' };
+  return group;
+}
+
+const panel1 = createPanel(panelMat1, new THREE.Vector3(-0.25, 0.85, -0.15));
+const panel2 = createPanel(panelMat2, new THREE.Vector3(0.25, 0.85, -0.15));
+scene.add(panel1);
+scene.add(panel2);
+
+const panels = [panel1, panel2];
+const snapTargets = [
+  { mesh: snapTarget1, pos: snapTarget1.position.clone(), taken: false },
+  { mesh: snapTarget2, pos: snapTarget2.position.clone(), taken: false }
+];
+
+// Pinch distance smoothing buffer
+const pinchSmooth = { left: [], right: [] };
+function getSmoothedPinch(hand, key) {
+  const thumb = getJointPosition(hand, 'thumb-tip');
+  const index = getJointPosition(hand, 'index-finger-tip');
+  if (!thumb || !index) return 999;
+  const dist = thumb.distanceTo(index);
+  const buf = pinchSmooth[key];
+  buf.push(dist);
+  if (buf.length > 5) buf.shift();
+  return buf.reduce((a, b) => a + b, 0) / buf.length;
+}
+
+// ============================================================
+// SCREWS (appear after snap)
+// ============================================================
+const screwGroup = new THREE.Group();
+screwGroup.visible = false;
+scene.add(screwGroup);
+
+const screws = [];
+
+function createScrew(pos) {
+  const group = new THREE.Group();
+  // Screw head
+  const headMat = new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 0.9, roughness: 0.2 });
+  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.004, 6), headMat);
+  head.rotation.x = Math.PI / 2;
+  group.add(head);
+  // Cross slot on head
+  const slotMat = new THREE.MeshStandardMaterial({ color: 0x333333 });
+  const slot1 = new THREE.Mesh(new THREE.BoxGeometry(0.008, 0.001, 0.002), slotMat);
+  slot1.position.z = 0.003;
+  group.add(slot1);
+  const slot2 = new THREE.Mesh(new THREE.BoxGeometry(0.001, 0.008, 0.002), slotMat);
+  slot2.position.z = 0.003;
+  group.add(slot2);
+  // Screw shaft
+  const shaftMat = new THREE.MeshStandardMaterial({ color: 0x999999, metalness: 0.8, roughness: 0.3 });
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.003, 0.003, SCREW_PITCH * REQUIRED_TURNS, 16), shaftMat);
+  shaft.rotation.x = Math.PI / 2;
+  shaft.position.z = -(SCREW_PITCH * REQUIRED_TURNS) / 2;
+  shaft.visible = true;
+  group.add(shaft);
+  // Thread helix visual
+  const threadMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, metalness: 0.7 });
+  for (let i = 0; i < REQUIRED_TURNS * 8; i++) {
+    const angle = (i / 8) * Math.PI * 2;
+    const z = -(i / (REQUIRED_TURNS * 8)) * (SCREW_PITCH * REQUIRED_TURNS);
+    const threadBit = new THREE.Mesh(new THREE.SphereGeometry(0.0005, 4, 4), threadMat);
+    threadBit.position.set(Math.cos(angle) * 0.0035, Math.sin(angle) * 0.0035, z);
+    group.add(threadBit);
+  }
+
+  group.position.copy(pos);
+  group.userData = {
+    type: 'screw',
+    turns: 0,
+    maxTurns: REQUIRED_TURNS,
+    startZ: pos.z,
+    inserted: false,
+    lastAngle: null
+  };
+  return group;
+}
+
+// ============================================================
+// TOOL (screwdriver)
+// ============================================================
+const toolGroup = new THREE.Group();
+toolGroup.visible = false;
+scene.add(toolGroup);
+
+function createTool() {
+  // Handle
+  const handleMat = new THREE.MeshStandardMaterial({ color: 0xff6600, roughness: 0.6 });
+  const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.014, 0.10, 16), handleMat);
+  handle.position.y = 0.05;
+  toolGroup.add(handle);
+  // Grip texture
+  const gripMat = new THREE.MeshStandardMaterial({ color: 0xcc4400, roughness: 0.9 });
+  for (let i = 0; i < 8; i++) {
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.003, 0.008, 0.028), gripMat);
+    const angle = (i / 8) * Math.PI * 2;
+    grip.position.set(Math.cos(angle) * 0.013, 0.05, Math.sin(angle) * 0.013);
+    grip.lookAt(new THREE.Vector3(0, 0.05, 0));
+    toolGroup.add(grip);
+  }
+  // Shaft
+  const shaftMat = new THREE.MeshStandardMaterial({ color: 0xcccccc, metalness: 0.9, roughness: 0.1 });
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.004, 0.08, 16), shaftMat);
+  shaft.position.y = -0.04;
+  toolGroup.add(shaft);
+  // Phillips tip
+  const tipMat = new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.9 });
+  const tip1 = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.015, 0.001), tipMat);
+  tip1.position.y = -0.085;
+  toolGroup.add(tip1);
+  const tip2 = new THREE.Mesh(new THREE.BoxGeometry(0.001, 0.015, 0.006), tipMat);
+  tip2.position.y = -0.085;
+  toolGroup.add(tip2);
+
+  toolGroup.position.set(0.2, 0.85, -0.1);
+  toolGroup.userData = { grabbable: true, type: 'tool', grabbed: false };
+}
+createTool();
+
+// ============================================================
+// STATE
+// ============================================================
+let phase = 'PANEL_PLACEMENT'; // PANEL_PLACEMENT → SCREW_PHASE → COMPLETE
+let panelsSnapped = 0;
+let activeScrew = null;
+let currentTorque = 0;
+
+const handStates = {
+  left: { grabbed: null, prevWristAngle: null, grabOffset: null },
+  right: { grabbed: null, prevWristAngle: null, grabOffset: null }
+};
+
+// ============================================================
+// XR HANDS
+// ============================================================
+let hand1, hand2, handModel1, handModel2;
+const handModelFactory = new XRHandModelFactory();
+
+function setupXRHands() {
+  hand1 = renderer.xr.getHand(0);
+  hand2 = renderer.xr.getHand(1);
+
+  handModel1 = handModelFactory.createHandModel(hand1, 'mesh');
+  handModel2 = handModelFactory.createHandModel(hand2, 'mesh');
+
+  hand1.add(handModel1);
+  hand2.add(handModel2);
+
+  scene.add(hand1);
+  scene.add(hand2);
+
+  // Also add controller models as fallback
+  const ctrl1 = renderer.xr.getController(0);
+  const ctrl2 = renderer.xr.getController(1);
+  scene.add(ctrl1);
+  scene.add(ctrl2);
+}
+
+// ============================================================
+// HAND JOINT HELPERS
+// ============================================================
+function getJointPosition(hand, jointName) {
+  const joint = hand.joints[jointName];
+  if (!joint) return null;
+  const pos = new THREE.Vector3();
+  joint.getWorldPosition(pos);
+  return pos;
+}
+
+function isPinchGrab(hand, key) {
+  const dist = getSmoothedPinch(hand, key);
+  return dist < PINCH_GRAB;
+}
+
+function isPinchHeld(hand, key) {
+  const dist = getSmoothedPinch(hand, key);
+  return dist < PINCH_RELEASE;
+}
+
+function getPinchPoint(hand) {
+  const thumb = getJointPosition(hand, 'thumb-tip');
+  const index = getJointPosition(hand, 'index-finger-tip');
+  if (!thumb || !index) return null;
+  return new THREE.Vector3().addVectors(thumb, index).multiplyScalar(0.5);
+}
+
+function getWristRotation(hand) {
+  const wrist = hand.joints['wrist'];
+  if (!wrist) return null;
+  const q = new THREE.Quaternion();
+  wrist.getWorldQuaternion(q);
+  return q;
+}
+
+// ============================================================
+// GRAB / RELEASE LOGIC
+// ============================================================
+function findNearestGrabbable(point) {
+  let nearest = null;
+  let minDist = GRAB_DISTANCE;
+
+  if (phase === 'PANEL_PLACEMENT') {
+    for (const panel of panels) {
+      if (panel.userData.snapped) continue;
+      const d = point.distanceTo(panel.position);
+      if (d < minDist) { minDist = d; nearest = panel; }
+    }
+  }
+
+  if (phase === 'SCREW_PHASE' && toolGroup.visible && !toolGroup.userData.grabbed) {
+    const d = point.distanceTo(toolGroup.position);
+    if (d < minDist) { nearest = toolGroup; }
+  }
+
+  return nearest;
+}
+
+function trySnap(panel) {
+  for (const target of snapTargets) {
+    if (target.taken) continue;
+    const d = panel.position.distanceTo(target.pos);
+    if (d < SNAP_DISTANCE) {
+      // Snap!
+      panel.position.copy(target.pos);
+      panel.rotation.set(0, 0, 0);
+      panel.userData.snapped = true;
+      panel.userData.snapTarget = target;
+      target.taken = true;
+      target.mesh.material = target.mesh.material.clone();
+      target.mesh.material.color.set(0xffffff);
+      target.mesh.material.opacity = 0.6;
+      panelsSnapped++;
+
+      // Flash effect
+      flashEffect(panel.position);
+
+      if (panelsSnapped >= 2) {
+        setTimeout(() => enterScrewPhase(), 500);
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+function flashEffect(pos) {
+  const flashMat = new THREE.MeshBasicMaterial({ color: 0x00ff88, transparent: true, opacity: 0.8 });
+  const flash = new THREE.Mesh(new THREE.SphereGeometry(0.05, 16, 16), flashMat);
+  flash.position.copy(pos);
+  scene.add(flash);
+  const startTime = performance.now();
+  function animFlash() {
+    const elapsed = (performance.now() - startTime) / 1000;
+    flash.scale.setScalar(1 + elapsed * 3);
+    flash.material.opacity = 0.8 - elapsed * 2;
+    if (flash.material.opacity > 0) {
+      requestAnimationFrame(animFlash);
+    } else {
+      scene.remove(flash);
+      flash.geometry.dispose();
+      flash.material.dispose();
+    }
+  }
+  animFlash();
+}
+
+// ============================================================
+// SCREW PHASE
+// ============================================================
+function enterScrewPhase() {
+  phase = 'SCREW_PHASE';
+
+  // Create screws at panel screw hole positions
+  const screwPositions = [];
+  for (const panel of panels) {
+    // Two screw holes per panel
+    const p1 = new THREE.Vector3(-0.04, 0.03, 0.005).applyMatrix4(panel.matrixWorld);
+    const p2 = new THREE.Vector3(0.04, -0.03, 0.005).applyMatrix4(panel.matrixWorld);
+    screwPositions.push(p1, p2);
+  }
+
+  for (const pos of screwPositions) {
+    const screw = createScrew(pos);
+    screwGroup.add(screw);
+    screws.push(screw);
+  }
+
+  screwGroup.visible = true;
+  toolGroup.visible = true;
+
+  // Hide snap outlines
+  for (const t of snapTargets) {
+    scene.remove(t.mesh);
+  }
+}
+
+// ============================================================
+// SCREW TURNING LOGIC
+// ============================================================
+function updateScrewTurning(hand, handState, dt) {
+  if (!handState.grabbed || handState.grabbed !== toolGroup) return;
+
+  // Tool tip position (bottom of screwdriver)
+  const tipPos = new THREE.Vector3(0, -0.09, 0);
+  toolGroup.localToWorld(tipPos);
+
+  // Find nearest screw (wider detection when tool is near)
+  let nearestScrew = null;
+  let minDist = 0.035; // 3.5cm detection radius
+  for (const screw of screws) {
+    if (screw.userData.inserted) continue;
+    const d = tipPos.distanceTo(screw.position);
+    if (d < minDist) { minDist = d; nearestScrew = screw; }
+  }
+
+  if (!nearestScrew) {
+    activeScrew = null;
+    currentTorque = 0;
+    handState.prevWristAngle = null;
+    return;
+  }
+
+  activeScrew = nearestScrew;
+
+  // Snap tool tip to screw when close (magnetic alignment)
+  if (minDist < 0.02) {
+    const screwWorldPos = nearestScrew.position.clone();
+    const toolWorldTip = tipPos;
+    const offset = new THREE.Vector3().subVectors(screwWorldPos, toolWorldTip);
+    toolGroup.position.add(offset.multiplyScalar(0.3));
+  }
+
+  // Use index finger rotation for more natural screw turning
+  const indexTip = getJointPosition(hand, 'index-finger-tip');
+  const thumbTip = getJointPosition(hand, 'thumb-tip');
+  if (!indexTip || !thumbTip) return;
+
+  // Calculate rotation angle from thumb-index vector projected on screw plane
+  const screwAxis = new THREE.Vector3(0, 0, -1); // screw goes into surface
+  const handVec = new THREE.Vector3().subVectors(indexTip, thumbTip);
+  const projected = handVec.clone().projectOnPlane(screwAxis);
+  const currentAngle = Math.atan2(projected.y, projected.x);
+
+  if (handState.prevWristAngle !== null) {
+    let deltaAngle = currentAngle - handState.prevWristAngle;
+
+    // Normalize to [-PI, PI]
+    while (deltaAngle > Math.PI) deltaAngle -= Math.PI * 2;
+    while (deltaAngle < -Math.PI) deltaAngle += Math.PI * 2;
+
+    // Dead zone to prevent jitter
+    if (Math.abs(deltaAngle) < 0.01) { handState.prevWristAngle = currentAngle; return; }
+    // Cap max delta per frame to prevent jumps
+    deltaAngle = Math.max(-0.3, Math.min(0.3, deltaAngle));
+
+    const deltaTurns = deltaAngle / (Math.PI * 2);
+    const sd = nearestScrew.userData;
+
+    // Apply rotation (smoothed)
+    sd.turns += deltaTurns;
+    sd.turns = Math.max(0, Math.min(sd.maxTurns, sd.turns));
+
+    // Torque simulation (increases exponentially with depth for realistic feel)
+    const progress = sd.turns / sd.maxTurns;
+    currentTorque = progress * progress * MAX_TORQUE;
+
+    // Move screw along Z axis (into the surface)
+    const depth = sd.turns * SCREW_PITCH;
+    nearestScrew.position.z = sd.startZ - depth;
+
+    // Rotate screw head visually
+    nearestScrew.rotation.z += deltaAngle;
+
+    // Check completion
+    if (sd.turns >= sd.maxTurns && !sd.inserted) {
+      sd.inserted = true;
+      sd.turns = sd.maxTurns;
+      nearestScrew.children[0].material = nearestScrew.children[0].material.clone();
+      nearestScrew.children[0].material.color.set(0x00ff00);
+      nearestScrew.children[0].material.emissive = new THREE.Color(0x00ff00);
+      nearestScrew.children[0].material.emissiveIntensity = 0.5;
+      flashEffect(nearestScrew.position);
+      checkAllScrews();
+    }
+  }
+
+  handState.prevWristAngle = currentAngle;
+}
+
+function checkAllScrews() {
+  const allDone = screws.every(s => s.userData.inserted);
+  if (allDone) {
+    phase = 'COMPLETE';
+    // Victory effect
+    for (let i = 0; i < 5; i++) {
+      setTimeout(() => {
+        const pos = new THREE.Vector3(
+          (Math.random() - 0.5) * 0.3,
+          0.95 + Math.random() * 0.2,
+          -0.3 + Math.random() * 0.1
+        );
+        flashEffect(pos);
+      }, i * 200);
+    }
+  }
+}
+
+// ============================================================
+// 3D HUD (in-world display for VR)
+// ============================================================
+let hudCanvas, hudTexture, hudMesh;
+
+function createWorldHUD() {
+  hudCanvas = document.createElement('canvas');
+  hudCanvas.width = 512;
+  hudCanvas.height = 320;
+  hudTexture = new THREE.CanvasTexture(hudCanvas);
+  hudTexture.needsUpdate = true;
+
+  const hudGeo = new THREE.PlaneGeometry(0.35, 0.22);
+  const hudMat = new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true, opacity: 0.9 });
+  hudMesh = new THREE.Mesh(hudGeo, hudMat);
+  hudMesh.position.set(-0.45, 1.15, -0.4);
+  hudMesh.rotation.y = 0.3;
+  scene.add(hudMesh);
+}
+
+function updateWorldHUD() {
+  if (!hudCanvas) return;
+  const ctx = hudCanvas.getContext('2d');
+  ctx.clearRect(0, 0, 512, 320);
+
+  // Background
+  ctx.fillStyle = 'rgba(0, 15, 30, 0.92)';
+  ctx.roundRect(0, 0, 512, 320, 12);
+  ctx.fill();
+
+  // Border
+  ctx.strokeStyle = '#00aaff';
+  ctx.lineWidth = 2;
+  ctx.roundRect(2, 2, 508, 316, 12);
+  ctx.stroke();
+
+  // Title
+  ctx.fillStyle = '#00aaff';
+  ctx.font = 'bold 22px monospace';
+  ctx.fillText('TORQUE MONITOR', 20, 35);
+
+  // Divider
+  ctx.strokeStyle = '#00aaff44';
+  ctx.beginPath(); ctx.moveTo(20, 48); ctx.lineTo(492, 48); ctx.stroke();
+
+  // Phase
+  ctx.fillStyle = '#aaa';
+  ctx.font = '16px monospace';
+  ctx.fillText('Phase:', 20, 75);
+  ctx.fillStyle = phase === 'COMPLETE' ? '#00ff00' : '#ffaa00';
+  ctx.font = 'bold 16px monospace';
+  ctx.fillText(phase.replace('_', ' '), 120, 75);
+
+  // Screws
+  ctx.fillStyle = '#aaa';
+  ctx.font = '16px monospace';
+  for (let i = 0; i < screws.length; i++) {
+    const sd = screws[i].userData;
+    const y = 105 + i * 32;
+    ctx.fillStyle = '#aaa';
+    ctx.fillText(`Screw ${i + 1}:`, 20, y);
+
+    const turns = sd.turns.toFixed(2);
+    const pct = ((sd.turns / sd.maxTurns) * 100).toFixed(0);
+    ctx.fillStyle = sd.inserted ? '#00ff00' : '#ffcc00';
+    ctx.font = 'bold 16px monospace';
+    ctx.fillText(`${turns} / ${sd.maxTurns.toFixed(2)} turns (${pct}%)`, 140, y);
+
+    // Progress bar
+    ctx.fillStyle = '#333';
+    ctx.fillRect(140, y + 4, 200, 8);
+    ctx.fillStyle = sd.inserted ? '#00ff00' : '#00aaff';
+    ctx.fillRect(140, y + 4, 200 * (sd.turns / sd.maxTurns), 8);
+
+    ctx.font = '16px monospace';
+  }
+
+  // Torque
+  const torqueY = 105 + screws.length * 32 + 10;
+  ctx.fillStyle = '#aaa';
+  ctx.fillText('Torque:', 20, torqueY);
+  ctx.fillStyle = currentTorque > MAX_TORQUE * 0.9 ? '#ff4444' : '#00ff88';
+  ctx.font = 'bold 18px monospace';
+  ctx.fillText(`${currentTorque.toFixed(1)} / ${MAX_TORQUE} N·m`, 140, torqueY);
+
+  // Status
+  const statusY = torqueY + 35;
+  ctx.fillStyle = '#aaa';
+  ctx.font = '16px monospace';
+  ctx.fillText('Status:', 20, statusY);
+  let status = 'READY';
+  let statusColor = '#0af';
+  if (phase === 'COMPLETE') { status = 'ALL SCREWS SECURED'; statusColor = '#00ff00'; }
+  else if (activeScrew) { status = 'DRIVING SCREW...'; statusColor = '#ffaa00'; }
+  else if (phase === 'SCREW_PHASE') { status = 'GRAB TOOL'; statusColor = '#ff8800'; }
+  else { status = 'PLACE PANELS'; statusColor = '#ffcc00'; }
+  ctx.fillStyle = statusColor;
+  ctx.font = 'bold 16px monospace';
+  ctx.fillText(status, 140, statusY);
+
+  // Spec note
+  ctx.fillStyle = '#555';
+  ctx.font = '12px monospace';
+  ctx.fillText('AVIATION SPEC: MIL-DTL-25027 | 4 TURNS | 8.5 N·m MAX', 20, 300);
+
+  hudTexture.needsUpdate = true;
+}
+
+// ============================================================
+// 2D HUD UPDATE (for non-VR preview)
+// ============================================================
+function update2DHUD() {
+  const hudDiv = document.getElementById('hud');
+  hudDiv.style.display = 'block';
+  document.getElementById('hudPhase').textContent = phase.replace('_', ' ');
+  if (screws.length > 0) {
+    document.getElementById('hudScrew1').textContent =
+      `${screws[0].userData.turns.toFixed(2)} / ${REQUIRED_TURNS.toFixed(2)} turns`;
+    if (screws.length > 1) {
+      document.getElementById('hudScrew2').textContent =
+        `${screws[1].userData.turns.toFixed(2)} / ${REQUIRED_TURNS.toFixed(2)} turns`;
+    }
+  }
+  document.getElementById('hudTorque').textContent = `${currentTorque.toFixed(1)} N·m`;
+  let status = phase === 'COMPLETE' ? 'COMPLETE' : activeScrew ? 'DRIVING' : 'READY';
+  document.getElementById('hudStatus').textContent = status;
+}
+
+// ============================================================
+// ANIMATION LOOP
+// ============================================================
+const clock = new THREE.Clock();
+
+function animate() {
+  const dt = clock.getDelta();
+
+  // Animate snap targets (subtle pulse)
+  if (phase === 'PANEL_PLACEMENT') {
+    const pulse = 0.15 + Math.sin(performance.now() * 0.003) * 0.1;
+    for (const t of snapTargets) {
+      if (!t.taken) t.mesh.material.opacity = pulse;
+    }
+  }
+
+  // Tool hover glow
+  if (phase === 'SCREW_PHASE' && toolGroup.visible) {
+    const glow = 0.7 + Math.sin(performance.now() * 0.005) * 0.3;
+    toolGroup.children[0].material.emissive = new THREE.Color(0xff6600);
+    toolGroup.children[0].material.emissiveIntensity = toolGroup.userData.grabbed ? 0 : glow * 0.3;
+  }
+
+  // Process hands
+  const hands = [
+    { xrHand: hand1, key: 'left' },
+    { xrHand: hand2, key: 'right' }
+  ];
+
+  for (const { xrHand, key } of hands) {
+    if (!xrHand || !xrHand.joints || Object.keys(xrHand.joints).length === 0) continue;
+    const state = handStates[key];
+    const pinchPoint = getPinchPoint(xrHand);
+
+    if (!state.grabbed) {
+      // Not holding anything → check for NEW grab (tight threshold)
+      if (isPinchGrab(xrHand, key) && pinchPoint) {
+        const target = findNearestGrabbable(pinchPoint);
+        if (target) {
+          state.grabbed = target;
+          state.grabOffset = new THREE.Vector3().subVectors(target.position, pinchPoint);
+          if (target.userData.type === 'tool') target.userData.grabbed = true;
+        }
+      }
+    } else {
+      // Already holding → use WIDER threshold to release (hysteresis)
+      if (!isPinchHeld(xrHand, key)) {
+        // Release
+        if (state.grabbed.userData.type === 'panel' && !state.grabbed.userData.snapped) {
+          trySnap(state.grabbed);
+        }
+        if (state.grabbed.userData.type === 'tool') {
+          state.grabbed.userData.grabbed = false;
+          state.prevWristAngle = null;
+        }
+        state.grabbed = null;
+      }
+    }
+
+    // Move grabbed object (smooth)
+    if (state.grabbed && pinchPoint) {
+      const targetPos = pinchPoint.clone().add(state.grabOffset || new THREE.Vector3());
+
+      if (state.grabbed.userData.type === 'panel') {
+        state.grabbed.position.lerp(targetPos, GRAB_SMOOTHING);
+      } else if (state.grabbed.userData.type === 'tool') {
+        // Tool: attach to hand with proper orientation
+        const middleTip = getJointPosition(xrHand, 'middle-finger-tip');
+        const wrist = getJointPosition(xrHand, 'wrist');
+        if (wrist && middleTip) {
+          // Position: center of palm
+          const palmCenter = new THREE.Vector3().addVectors(wrist, pinchPoint).multiplyScalar(0.5);
+          state.grabbed.position.lerp(palmCenter, GRAB_SMOOTHING);
+
+          // Orientation: tool shaft along wrist→fingers direction
+          const dir = new THREE.Vector3().subVectors(middleTip, wrist).normalize();
+          const up = new THREE.Vector3(0, 1, 0);
+          const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, -1, 0), dir);
+          state.grabbed.quaternion.slerp(q, 0.4);
+        }
+        updateScrewTurning(xrHand, state, dt);
+      }
+    }
+  }
+
+  // Update HUDs
+  if (renderer.xr.isPresenting) {
+    updateWorldHUD();
+  } else {
+    update2DHUD();
+  }
+
+  renderer.render(scene, camera);
+}
+
+// ============================================================
+// INIT
+// ============================================================
+createWorldHUD();
+setupXRHands();
+
+// VR Entry
+async function enterVR() {
+  if (!navigator.xr) {
+    document.getElementById('info').textContent = 'WebXR not supported';
+    return;
+  }
+
+  const infoEl = document.getElementById('info');
+  const startBtn = document.getElementById('startBtn');
+
+  try {
+    // AR first (passthrough/real world visible), fallback to VR
+    let mode = 'immersive-ar';
+    let supported = await navigator.xr.isSessionSupported('immersive-ar');
+    if (!supported) {
+      supported = await navigator.xr.isSessionSupported('immersive-vr');
+      mode = 'immersive-vr';
+    }
+    if (!supported) {
+      infoEl.textContent = 'No XR session type supported';
+      return;
+    }
+
+    infoEl.textContent = `Starting ${mode} session...`;
+
+    const session = await navigator.xr.requestSession(mode, {
+      requiredFeatures: ['hand-tracking'],
+      optionalFeatures: ['local-floor', 'bounded-floor', 'layers']
+    });
+
+    renderer.xr.setSession(session);
+    startBtn.style.display = 'none';
+    infoEl.textContent = 'Hand tracking active - Place panels on frame';
+    window.__xrError = null;
+
+    session.addEventListener('end', () => {
+      startBtn.style.display = '';
+      infoEl.textContent = 'Session ended - tap to restart';
+    });
+
+  } catch (err) {
+    console.error('XR Session error:', err);
+    window.__xrError = err.message;
+    infoEl.textContent = 'XR Error: ' + err.message;
+  }
+}
+
+// Button click
+document.getElementById('startBtn').addEventListener('click', enterVR);
+// Also allow tapping anywhere on the page to enter VR
+document.body.addEventListener('click', (e) => {
+  if (e.target.id !== 'startBtn' && !renderer.xr.isPresenting) enterVR();
+});
+
+renderer.setAnimationLoop(animate);
+
+// Resize
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ============================================================
+// DESKTOP PREVIEW: Mouse controls for testing without XR
+// ============================================================
+let mouseDown = false;
+let selectedPanel = null;
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+renderer.domElement.addEventListener('mousedown', (e) => {
+  mouseDown = true;
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+
+  if (phase === 'PANEL_PLACEMENT') {
+    for (const panel of panels) {
+      if (panel.userData.snapped) continue;
+      const intersects = raycaster.intersectObjects(panel.children, true);
+      if (intersects.length > 0) { selectedPanel = panel; break; }
+    }
+  }
+});
+
+renderer.domElement.addEventListener('mousemove', (e) => {
+  if (!mouseDown || !selectedPanel) return;
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0.3);
+  const point = new THREE.Vector3();
+  raycaster.ray.intersectPlane(plane, point);
+  if (point) selectedPanel.position.copy(point);
+});
+
+renderer.domElement.addEventListener('mouseup', () => {
+  if (selectedPanel) {
+    trySnap(selectedPanel);
+    selectedPanel = null;
+  }
+  mouseDown = false;
+});
+
+// Expose for debugging via CDP
+window.__app = { scene, camera, renderer, panels, screws, hand1, hand2, phase: () => phase };
+window.__xrError = null;
+
+console.log('Aircraft Assembly WebXR Trainer initialized');
+console.log('Phase 1: Grab and place 2 panels onto the aircraft frame');
+console.log('Phase 2: Use the screwdriver tool to drive 4 screws (4 turns each)');
+</script>
+</body>
+</html>
