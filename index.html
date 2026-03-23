@@ -65,7 +65,7 @@ const REQUIRED_TURNS = 4.0;
 const SCREW_PITCH = 0.005;       // meters per turn (5mm pitch, visible)
 const MAX_TORQUE = 8.5;          // N·m (aviation spec)
 const SNAP_DISTANCE = 0.08;     // 8cm snap threshold (forgiving)
-const GRAB_DISTANCE = 0.05;     // 5cm grab threshold (wider)
+const GRAB_DISTANCE = 0.08;     // 8cm grab threshold
 const PINCH_GRAB = 0.03;        // pinch to START grab
 const PINCH_RELEASE = 0.05;     // pinch to RELEASE grab (hysteresis)
 const GRAB_SMOOTHING = 0.7;     // position lerp factor
@@ -293,7 +293,7 @@ function createTool() {
   torqueDisplay.userData.texture = tTex;
   toolGroup.add(torqueDisplay);
 
-  toolGroup.position.set(0.2, 0.85, -0.1);
+  toolGroup.position.set(0.35, 0.85, 0.05);
   toolGroup.userData = {
     grabbable: true,
     type: 'tool',
